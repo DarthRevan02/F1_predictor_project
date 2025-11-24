@@ -8,6 +8,11 @@ class WDCSimulator:
         self.drivers = drivers
         self.points_system = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
         self.current_standings = current_standings or {}
+        self.qualifying_predictor = None
+        
+    def set_qualifying_predictor(self, predictor):
+        """Set qualifying predictor for grid position predictions"""
+        self.qualifying_predictor = predictor
         
     def set_current_standings(self, standings):
         """
@@ -49,6 +54,9 @@ class WDCSimulator:
         position_counts = {driver: [0] * 4 for driver in self.drivers}  # Wins, Podiums, Top5, Top10
         final_points = {driver: [] for driver in self.drivers}
         
+        # Get predicted starting grids for each race
+        predicted_grids = self._predict_grids_for_races(remaining_races)
+        
         for batch_start in range(0, num_simulations, batch_size):
             current_batch_size = min(batch_size, num_simulations - batch_start)
             
@@ -62,10 +70,29 @@ class WDCSimulator:
                     if driver not in total_points:
                         total_points[driver] = 0
                 
+                # Track race results for grid prediction
+                previous_race_results = None
+                
                 # Simulate remaining races
                 for race_idx, race_name in enumerate(remaining_races):
-                    # Generate race results based on driver performance tiers
-                    race_results = self._simulate_single_race(driver_tiers)
+                    # Get starting grid for this race
+                    if race_idx == 0:
+                        # First race: use predicted qualifying positions
+                        starting_grid = predicted_grids.get(race_name, None)
+                    else:
+                        # Subsequent races: use previous race results with variance
+                        starting_grid = self._predict_grid_from_previous_race(
+                            previous_race_results, driver_tiers
+                        )
+                    
+                    # Generate race results based on starting grid and performance
+                    race_results = self._simulate_single_race(
+                        driver_tiers, 
+                        starting_grid=starting_grid
+                    )
+                    
+                    # Store for next iteration
+                    previous_race_results = race_results
                     
                     # Award points
                     for pos, driver in enumerate(race_results):
@@ -133,26 +160,212 @@ class WDCSimulator:
         # Return performance for all drivers, defaulting to 0.50 for unknown
         return {driver: performance.get(driver, 0.50) for driver in self.drivers}
     
-    def _simulate_single_race(self, driver_tiers):
+    def _predict_grids_for_races(self, remaining_races):
+        """
+        Get actual or predicted qualifying grids for remaining races
+        Tries FastF1 API first for completed qualifying, falls back to predictions
+        
+        Returns:
+            dict: {race_name: {driver: grid_position}}
+        """
+        predicted_grids = {}
+        
+        print(f"   📊 Getting starting grids for {len(remaining_races)} race(s)...")
+        
+        for race_name in remaining_races:
+            # Try to get actual qualifying results from FastF1
+            actual_grid = self._get_actual_qualifying_from_fastf1(race_name)
+            
+            if actual_grid:
+                predicted_grids[race_name] = actual_grid
+                print(f"   ✓ Loaded ACTUAL qualifying grid for {race_name} from FastF1")
+            elif self.qualifying_predictor:
+                # Fall back to prediction if qualifying hasn't happened yet
+                try:
+                    quali_prediction = self.qualifying_predictor.predict_qualifying(race_name)
+                    grid = {}
+                    for pred in quali_prediction['predicted_grid']:
+                        grid[pred['driver']] = pred['predicted_grid']
+                    predicted_grids[race_name] = grid
+                    print(f"   ✓ Predicted grid for {race_name} (qualifying not yet completed)")
+                except Exception as e:
+                    print(f"   ⚠️  Could not predict grid for {race_name}: {e}")
+                    predicted_grids[race_name] = None
+            else:
+                print(f"   ⚠️  No data available for {race_name}, using performance-based grid")
+                predicted_grids[race_name] = None
+        
+        return predicted_grids
+    
+    def _get_actual_qualifying_from_fastf1(self, race_name, year=2025):
+        """
+        Get actual qualifying results from FastF1 API if available
+        
+        Args:
+            race_name (str): Name of the race
+            year (int): Season year
+            
+        Returns:
+            dict: {driver: grid_position} or None if not available
+        """
+        try:
+            import fastf1
+            from datetime import datetime, timezone
+            
+            # Get the race schedule
+            schedule = fastf1.get_event_schedule(year)
+            current_time = datetime.now(timezone.utc)
+            
+            # Find the race in schedule
+            race_event = None
+            for idx, event in schedule.iterrows():
+                if event['EventName'] == race_name:
+                    race_event = event
+                    break
+            
+            if race_event is None:
+                return None
+            
+            # Check if qualifying has happened (event date has passed)
+            event_date = race_event['EventDate']
+            if event_date.tzinfo is None:
+                event_date = event_date.replace(tzinfo=timezone.utc)
+            
+            # If race hasn't happened yet, qualifying likely hasn't either
+            if current_time < event_date:
+                # Check if we're close to race day (qualifying might be done)
+                # Qualifying usually happens 1 day before race
+                days_until_race = (event_date - current_time).days
+                
+                if days_until_race > 1:
+                    # Too early, qualifying definitely hasn't happened
+                    return None
+            
+            # Try to load qualifying session
+            try:
+                round_num = race_event['RoundNumber']
+                qualifying = fastf1.get_session(year, round_num, 'Q')
+                qualifying.load()
+                
+                # Get qualifying results
+                results = qualifying.results
+                
+                if results.empty:
+                    return None
+                
+                # Extract grid positions
+                grid = {}
+                for idx, row in results.iterrows():
+                    driver_code = row['Abbreviation']
+                    # Use Position from qualifying results
+                    if pd.notna(row['Position']):
+                        grid[driver_code] = int(row['Position'])
+                
+                if len(grid) > 0:
+                    return grid
+                else:
+                    return None
+                    
+            except Exception as e:
+                # Qualifying session not available or not loaded yet
+                return None
+                
+        except Exception as e:
+            # Any error in fetching, return None to fall back to prediction
+            return None
+    
+    def _predict_grid_from_previous_race(self, previous_results, driver_tiers):
+        """
+        Predict next race starting grid based on previous race results
+        Good performers likely to qualify well again
+        
+        Args:
+            previous_results (list): List of drivers in finish order
+            driver_tiers (dict): Driver performance ratings
+            
+        Returns:
+            dict: {driver: estimated_grid_position}
+        """
+        if not previous_results:
+            return None
+        
+        # Drivers who finished well are more likely to qualify well
+        # But add variance for track-specific performance
+        grid = {}
+        
+        for driver in driver_tiers.keys():
+            if driver in previous_results:
+                # Find finish position
+                finish_pos = previous_results.index(driver) + 1
+                
+                # Grid position correlates with race finish but with variance
+                # Top finishers likely to qualify well again (±3 positions variance)
+                base_grid = finish_pos
+                variance = np.random.randint(-3, 4)
+                
+                # Better drivers have less variance (more consistent)
+                driver_skill = driver_tiers.get(driver, 0.5)
+                if driver_skill > 0.85:
+                    variance = variance // 2  # Top drivers more consistent
+                
+                predicted_grid = max(1, min(20, base_grid + variance))
+                grid[driver] = predicted_grid
+            else:
+                # Driver DNF'd last race, estimate based on performance tier
+                driver_skill = driver_tiers.get(driver, 0.5)
+                if driver_skill > 0.85:
+                    grid[driver] = np.random.randint(1, 8)
+                elif driver_skill > 0.75:
+                    grid[driver] = np.random.randint(6, 14)
+                else:
+                    grid[driver] = np.random.randint(12, 21)
+        
+        return grid
+    
+    def _simulate_single_race(self, driver_tiers, starting_grid=None):
         """
         Simulate a single race with weighted random results
         
         Args:
             driver_tiers (dict): Performance weights for each driver
+            starting_grid (dict): Starting positions {driver: grid_position}
             
         Returns:
             list: Ordered list of drivers (winner first)
         """
         # Get performance weights
         drivers = list(driver_tiers.keys())
-        weights = [driver_tiers[d] for d in drivers]
         
-        # Add randomness to weights (race incidents, luck, etc.)
         race_weights = []
-        for weight in weights:
-            # Add random variance (±20%)
-            variance = np.random.uniform(0.8, 1.2)
-            race_weights.append(weight * variance)
+        for driver in drivers:
+            base_weight = driver_tiers[driver]
+            
+            # Grid position influence (starting further forward is advantage)
+            if starting_grid and driver in starting_grid:
+                grid_pos = starting_grid[driver]
+                # Convert grid position to weight bonus (P1 = +0.15, P20 = -0.05)
+                grid_bonus = (21 - grid_pos) * 0.01  # Max +0.20, Min -0.00
+            else:
+                # No grid info, use performance tier to estimate
+                if base_weight > 0.85:
+                    grid_bonus = 0.15
+                elif base_weight > 0.75:
+                    grid_bonus = 0.05
+                else:
+                    grid_bonus = -0.05
+            
+            # Add randomness for race incidents, strategy, luck (±20%)
+            race_variance = np.random.uniform(0.85, 1.15)
+            
+            # Calculate final race weight
+            final_weight = (base_weight + grid_bonus) * race_variance
+            
+            # DNF probability (5% base, higher for incidents)
+            dnf_chance = 0.05
+            if np.random.random() < dnf_chance:
+                final_weight = 0  # DNF = worst position
+            
+            race_weights.append(final_weight)
         
         # Sort drivers by their race performance
         driver_performance = list(zip(drivers, race_weights))
@@ -191,4 +404,4 @@ class WDCSimulator:
             return remaining
         except:
             # Fallback for 2025 end of season
-            return ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
+            return ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
