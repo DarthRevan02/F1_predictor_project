@@ -20,33 +20,22 @@ def initialize_system():
     print("=" * 50)
 
     print("\n[1/4] Loading F1 race data...")
-    print("   Loading multiple seasons for better predictions...")
+    print("   Loading 2025 season data only...")
     
-    # Load data from multiple years
-    all_data = []
-    years_to_load = [2024, 2025]  # Train on both 2024 and 2025
-    
-    for year in years_to_load:
-        try:
-            print(f"   → Loading {year} season data...")
-            loader = F1DataLoader(year=year)
-            df_year = loader.load_race_data(load_all=True)
-            
-            if not df_year.empty:
-                all_data.append(df_year)
-                print(f"   ✓ Loaded {len(df_year)} results from {year}")
-            else:
-                print(f"   ⚠️  No data found for {year} (season may not have started)")
-        except Exception as e:
-            print(f"   ⚠️  Error loading {year}: {e}")
-    
-    # Combine all data
-    if not all_data:
-        raise ValueError("❌ No F1 data available from any year. Please check your internet connection.")
-    
-    import pandas as pd
-    df = pd.concat(all_data, ignore_index=True)
-    print(f"\n✓ Combined dataset: {len(df)} total race results from {len(all_data)} season(s)")
+    # Load data from 2025 ONLY
+    try:
+        print(f"   → Loading 2025 season data...")
+        loader = F1DataLoader(year=2025)
+        df = loader.load_race_data(load_all=True)
+        
+        if df.empty:
+            raise ValueError("❌ No data found for 2025 season. The season may not have started yet or no races have been completed.")
+        
+        print(f"\n✓ Loaded dataset: {len(df)} total race results from 2025 season")
+        
+    except Exception as e:
+        print(f"   ⚠️  Error loading 2025 data: {e}")
+        raise ValueError("❌ No F1 data available from 2025. Please check your internet connection or wait for the season to start.")
 
     print("\n[2/4] Preprocessing data...")
     preprocessor = F1DataPreprocessor()
@@ -59,17 +48,32 @@ def initialize_system():
     if len(X) == 0:
         raise ValueError("❌ No training data available after preprocessing!")
     
-    print(f"   Training on {len(X)} race results...")
+    print(f"   Training on {len(X)} race results from 2025...")
     model = F1RaceModel()
     model.train(X, y)
 
     print("\n[4/4] Initializing predictor and simulator...")
     # 2025 Championship Standings (Current)
     current_standings = {
-        'NOR': 390, 'PIA': 366, 'VER': 341, 'RUS': 276, 'LEC': 214,
-        'HAM': 148, 'ANT': 122, 'ALB': 73, 'HUL': 43, 'HAD': 43,
-        'SAI': 30, 'LAW': 25, 'ALO': 22, 'GAS': 18, 'STR': 15,
-        'OCO': 12, 'TSU': 10, 'BEA': 8, 'DOR': 5, 'BOR': 3
+        'NOR': 390,   # Lando Norris :contentReference[oaicite:1]{index=1}
+        'PIA': 366,   # Oscar Piastri :contentReference[oaicite:2]{index=2}
+        'VER': 366,   # Max Verstappen :contentReference[oaicite:3]{index=3}
+        'RUS': 294,   # George Russell :contentReference[oaicite:4]{index=4}
+        'LEC': 226,   # Charles Leclerc :contentReference[oaicite:5]{index=5}
+        'HAM': 152,   # Lewis Hamilton :contentReference[oaicite:6]{index=6}
+        'ANT': 137,   # Kimi Antonelli :contentReference[oaicite:7]{index=7}
+        'ALB': 73,    # Alexander Albon :contentReference[oaicite:8]{index=8}
+        'HAD': 51,    # Isack Hadjar :contentReference[oaicite:9]{index=9}
+        'HUL': 49,    # Nico Hülkenberg :contentReference[oaicite:10]{index=10}
+        'SAI': 48,    # Carlos Sainz :contentReference[oaicite:11]{index=11}
+        'BEA': 41,    # Oliver Bearman :contentReference[oaicite:12]{index=12}
+        'ALO': 40,    # Fernando Alonso :contentReference[oaicite:13]{index=13}
+        'LAW': 36,    # Liam Lawson :contentReference[oaicite:14]{index=14}
+        'OCO': 32,    # Esteban Ocon :contentReference[oaicite:15]{index=15}
+        'STR': 32,    # Lance Stroll :contentReference[oaicite:16]{index=16}
+        'TSU': 28,    # Yuki Tsunoda :contentReference[oaicite:17]{index=17}
+        'GAS': 22,    # Pierre Gasly :contentReference[oaicite:18]{index=18}
+        'BOR': 19
     }
     
     print(f"\n📊 Current Championship Standings (2025):")
@@ -82,7 +86,7 @@ def initialize_system():
     
     print("\n" + "=" * 50)
     print("✓ SYSTEM READY!")
-    print(f"✓ Model trained on data from: {', '.join(map(str, [y for y in years_to_load]))}")
+    print(f"✓ Model trained on 2025 season data only")
     print("=" * 50)
     print("\n🌐 Open http://127.0.0.1:5000 in your browser\n")
 
@@ -112,9 +116,9 @@ def home():
     
     # Get remaining races - fallback to manual list if API fails
     try:
-        remaining_races = simulator.get_remaining_races_info(2024)
+        remaining_races = simulator.get_remaining_races_info(2025)
         if not remaining_races:
-            # Fallback for 2024 end of season
+            # Fallback for 2025 end of season
             remaining_races = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
     except Exception as e:
         app.logger.warning(f"Could not fetch remaining races: {e}")
@@ -194,11 +198,11 @@ def simulate_wdc():
     try:
         # Get remaining races with fallback
         try:
-            remaining_races = simulator.get_remaining_races_info(2024)
+            remaining_races = simulator.get_remaining_races_info(2025)
             if not remaining_races:
-                remaining_races = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
+                remaining_races = ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
         except:
-            remaining_races = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
+            remaining_races = ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
         
         probability, wins, stats = simulator.simulate_season(driver, remaining_races, num_sims)
         

@@ -42,7 +42,7 @@ class WDCSimulator:
         wins = 0
         batch_size = 10000
         
-        # Driver performance tiers (based on 2024 season)
+        # Driver performance tiers (based on 2025 season)
         driver_tiers = self._get_driver_performance_tiers()
         
         # Track detailed statistics
@@ -160,9 +160,12 @@ class WDCSimulator:
         
         return [driver for driver, _ in driver_performance]
     
-    def get_remaining_races_info(self, year=2024):
+    def get_remaining_races_info(self, year=2025):
         """
         Get information about remaining races in the season
+        
+        Args:
+            year (int): Year to check (default: 2025)
         
         Returns:
             list: List of remaining race names
@@ -187,5 +190,5 @@ class WDCSimulator:
             
             return remaining
         except:
-            # Fallback for 2024 end of season
+            # Fallback for 2025 end of season
             return ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']

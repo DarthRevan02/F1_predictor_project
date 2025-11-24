@@ -187,6 +187,21 @@ def get_html_template():
             background: #e60012;
             color: white;
         }
+        .refresh-btn {
+            background: #28a745;
+            margin-left: 10px;
+            padding: 12px 24px;
+            font-size: 16px;
+        }
+        .refresh-btn:hover {
+            background: #218838;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
         .error {
             background: #ff4444;
             color: white;
@@ -201,6 +216,15 @@ def get_html_template():
             border-radius: 8px;
             margin-top: 10px;
         }
+        .info-badge {
+            display: inline-block;
+            background: #17a2b8;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            margin-left: 10px;
+        }
     </style>
 </head>
 <body>
@@ -212,10 +236,15 @@ def get_html_template():
             <h2>Upcoming Race Winner Predictions</h2>
             <p style="margin-bottom: 20px; color: #666;">AI-powered predictions for the remaining races</p>
             
-            <div class="tabs">
-                <button class="tab active" onclick="predictSpecificRace('Las Vegas Grand Prix')">🎰 Las Vegas GP</button>
-                <button class="tab" onclick="predictSpecificRace('Qatar Grand Prix')">🏜️ Qatar GP</button>
-                <button class="tab" onclick="predictSpecificRace('Abu Dhabi Grand Prix')">🏝️ Abu Dhabi GP</button>
+            <div class="button-group">
+                <div class="tabs">
+                    <button class="tab active" onclick="showCachedRace('Las Vegas Grand Prix')">🎰 Las Vegas GP</button>
+                    <button class="tab" onclick="showCachedRace('Qatar Grand Prix')">🏜️ Qatar GP</button>
+                    <button class="tab" onclick="showCachedRace('Abu Dhabi Grand Prix')">🏝️ Abu Dhabi GP</button>
+                </div>
+                <button class="refresh-btn" onclick="refreshCurrentRace()">
+                    🔄 Generate New Predictions
+                </button>
             </div>
             
             <div class="loading" id="raceLoading">
@@ -291,9 +320,13 @@ def get_html_template():
     </div>
     
     <script>
-        // Predict specific race winner
-        async function predictSpecificRace(raceName) {
-            console.log('Predicting race:', raceName);
+        // Cache for storing predictions
+        const predictionCache = {};
+        let currentRace = 'Las Vegas Grand Prix';
+        
+        // Show cached race predictions or fetch new ones
+        function showCachedRace(raceName) {
+            currentRace = raceName;
             
             // Update active tab
             document.querySelectorAll('.tab').forEach(tab => {
@@ -303,6 +336,18 @@ def get_html_template():
                 }
             });
             
+            // Check if we have cached predictions
+            if (predictionCache[raceName]) {
+                console.log('Using cached predictions for:', raceName);
+                displayPredictions(predictionCache[raceName]);
+            } else {
+                console.log('Fetching new predictions for:', raceName);
+                fetchNewPredictions(raceName);
+            }
+        }
+        
+        // Fetch new predictions from server
+        async function fetchNewPredictions(raceName, forceRefresh = false) {
             document.getElementById('raceLoading').classList.add('active');
             document.getElementById('raceWinnerResult').innerHTML = '';
             
@@ -310,7 +355,10 @@ def get_html_template():
                 const response = await fetch('/predict_race_winner', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ race_name: raceName })
+                    body: JSON.stringify({ 
+                        race_name: raceName,
+                        force_refresh: forceRefresh
+                    })
                 });
                 
                 if (!response.ok) {
@@ -332,34 +380,12 @@ def get_html_template():
                     return;
                 }
                 
-                const topDrivers = result.predictions.slice(0, 10);
+                // Cache the predictions in browser memory (for quick access)
+                predictionCache[raceName] = result;
                 
-                let html = `
-                    <div class="result">
-                        <h3>🏆 ${result.race_name} - Predicted Results</h3>
-                        <ul class="driver-list">
-                `;
+                // Display the predictions
+                displayPredictions(result);
                 
-                topDrivers.forEach((pred, idx) => {
-                    const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `P${pred.predicted_position}`;
-                    html += `
-                        <li>
-                            <span><strong>${medal}</strong> ${pred.driver} (${pred.team})</span>
-                            <span>${pred.predicted_points} pts | ${pred.win_probability}% win</span>
-                        </li>
-                    `;
-                });
-                
-                html += `
-                        </ul>
-                        <div class="success" style="margin-top: 20px;">
-                            <strong>🏆 Predicted Winner:</strong> ${result.winner.driver} from ${result.winner.team}<br>
-                            <strong>Win Probability:</strong> ${result.winner.win_probability}%
-                        </div>
-                    </div>
-                `;
-                
-                document.getElementById('raceWinnerResult').innerHTML = html;
             } catch (error) {
                 console.error('Error:', error);
                 document.getElementById('raceLoading').classList.remove('active');
@@ -372,10 +398,53 @@ def get_html_template():
             }
         }
         
-        // Automatically predict Las Vegas on load
+        // Display predictions (from cache or new)
+        function displayPredictions(result) {
+            const topDrivers = result.predictions.slice(0, 10);
+            const isCached = predictionCache[result.race_name] !== undefined;
+            
+            let html = `
+                <div class="result">
+                    <h3>🏆 ${result.race_name} - Predicted Results</h3>
+                    ${isCached ? '<span class="info-badge">📋 Cached Predictions</span>' : '<span class="info-badge">✨ Fresh Predictions</span>'}
+                    <ul class="driver-list">
+            `;
+            
+            topDrivers.forEach((pred, idx) => {
+                const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `P${pred.predicted_position}`;
+                html += `
+                    <li>
+                        <span><strong>${medal}</strong> ${pred.driver} (${pred.team})</span>
+                        <span>${pred.predicted_points} pts | ${pred.win_probability}% win</span>
+                    </li>
+                `;
+            });
+            
+            html += `
+                    </ul>
+                    <div class="success" style="margin-top: 20px;">
+                        <strong>🏆 Predicted Winner:</strong> ${result.winner.driver} from ${result.winner.team}<br>
+                        <strong>Win Probability:</strong> ${result.winner.win_probability}%
+                    </div>
+                </div>
+            `;
+            
+            document.getElementById('raceWinnerResult').innerHTML = html;
+        }
+        
+        // Refresh predictions for current race
+        function refreshCurrentRace() {
+            console.log('Refreshing predictions for:', currentRace);
+            // Clear cache for current race
+            delete predictionCache[currentRace];
+            // Fetch new predictions
+            fetchNewPredictions(currentRace);
+        }
+        
+        // Automatically load Las Vegas on page load
         window.onload = () => {
             setTimeout(() => {
-                predictSpecificRace('Las Vegas Grand Prix');
+                showCachedRace('Las Vegas Grand Prix');
             }, 500);
         };
         
