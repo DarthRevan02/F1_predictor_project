@@ -187,20 +187,17 @@ def get_html_template():
             background: #e60012;
             color: white;
         }
-        .refresh-btn {
+        .tab.refresh-btn {
             background: #28a745;
-            margin-left: 10px;
-            padding: 12px 24px;
-            font-size: 16px;
+            color: white;
+            margin-left: auto;
         }
-        .refresh-btn:hover {
+        .tab.refresh-btn:hover {
             background: #218838;
         }
-        .button-group {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
+        .tab.refresh-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
         }
         .error {
             background: #ff4444;
@@ -236,13 +233,11 @@ def get_html_template():
             <h2>Upcoming Race Winner Predictions</h2>
             <p style="margin-bottom: 20px; color: #666;">AI-powered predictions for the remaining races</p>
             
-            <div class="button-group">
-                <div class="tabs">
-                    <button class="tab active" onclick="showCachedRace('Las Vegas Grand Prix')">🎰 Las Vegas GP</button>
-                    <button class="tab" onclick="showCachedRace('Qatar Grand Prix')">🏜️ Qatar GP</button>
-                    <button class="tab" onclick="showCachedRace('Abu Dhabi Grand Prix')">🏝️ Abu Dhabi GP</button>
-                </div>
-                <button class="refresh-btn" onclick="refreshCurrentRace()">
+            <div class="tabs">
+                <button class="tab active" onclick="showCachedRace('Las Vegas Grand Prix')">🎰 Las Vegas GP</button>
+                <button class="tab" onclick="showCachedRace('Qatar Grand Prix')">🏜️ Qatar GP</button>
+                <button class="tab" onclick="showCachedRace('Abu Dhabi Grand Prix')">🏝️ Abu Dhabi GP</button>
+                <button class="tab refresh-btn" onclick="refreshCurrentRace()">
                     🔄 Generate New Predictions
                 </button>
             </div>
@@ -336,10 +331,16 @@ def get_html_template():
                 }
             });
             
+            // Reset refresh button state (will be updated when predictions load)
+            const refreshBtn = document.querySelector('.tab.refresh-btn');
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = '🔄 Generate New Predictions';
+            
             // Check if we have cached predictions
             if (predictionCache[raceName]) {
                 console.log('Using cached predictions for:', raceName);
                 displayPredictions(predictionCache[raceName]);
+                updateRefreshButton(predictionCache[raceName].race_ended);
             } else {
                 console.log('Fetching new predictions for:', raceName);
                 fetchNewPredictions(raceName);
@@ -361,11 +362,25 @@ def get_html_template():
                     })
                 });
                 
+                const result = await response.json();
+                
+                // Check if race has ended and we tried to refresh
+                if (response.status === 403 && result.race_ended) {
+                    document.getElementById('raceLoading').classList.remove('active');
+                    document.getElementById('raceWinnerResult').innerHTML = `
+                        <div class="error">
+                            🏁 <strong>${result.race_name}</strong> has already ended.<br>
+                            Predictions are locked and cannot be regenerated.
+                        </div>
+                    `;
+                    updateRefreshButton(true);
+                    return;
+                }
+                
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 
-                const result = await response.json();
                 console.log('Received result:', result);
                 
                 document.getElementById('raceLoading').classList.remove('active');
@@ -382,6 +397,9 @@ def get_html_template():
                 
                 // Cache the predictions in browser memory (for quick access)
                 predictionCache[raceName] = result;
+                
+                // Update refresh button state based on race status
+                updateRefreshButton(result.race_ended);
                 
                 // Display the predictions
                 displayPredictions(result);
@@ -433,12 +451,59 @@ def get_html_template():
         }
         
         // Refresh predictions for current race
-        function refreshCurrentRace() {
+        async function refreshCurrentRace() {
             console.log('Refreshing predictions for:', currentRace);
-            // Clear cache for current race
-            delete predictionCache[currentRace];
-            // Fetch new predictions
-            fetchNewPredictions(currentRace);
+            
+            const refreshBtn = document.querySelector('.tab.refresh-btn');
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '⏳ Generating...';
+            
+            try {
+                // Clear server cache
+                await fetch('/clear_cache', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ race_name: currentRace })
+                });
+                
+                // Clear browser cache for current race
+                delete predictionCache[currentRace];
+                
+                // Fetch new predictions with force refresh
+                await fetchNewPredictions(currentRace, true);
+                
+            } catch (error) {
+                console.error('Error refreshing predictions:', error);
+                
+                // Check if race has ended
+                if (error.message && error.message.includes('Race has already ended')) {
+                    document.getElementById('raceWinnerResult').innerHTML = `
+                        <div class="error">
+                            🏁 ${currentRace} has already ended. Predictions are locked and cannot be regenerated.
+                        </div>
+                    `;
+                    refreshBtn.disabled = true;
+                    refreshBtn.textContent = '🔒 Race Ended';
+                }
+            } finally {
+                if (!refreshBtn.disabled) {
+                    refreshBtn.disabled = false;
+                    refreshBtn.textContent = '🔄 Generate New Predictions';
+                }
+            }
+        }
+        
+        // Update refresh button state
+        function updateRefreshButton(raceEnded) {
+            const refreshBtn = document.querySelector('.tab.refresh-btn');
+            
+            if (raceEnded) {
+                refreshBtn.disabled = true;
+                refreshBtn.textContent = '🔒 Race Ended';
+            } else {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = '🔄 Generate New Predictions';
+            }
         }
         
         // Automatically load Las Vegas on page load

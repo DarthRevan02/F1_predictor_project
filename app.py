@@ -5,12 +5,96 @@ from model_training import F1RaceModel
 from prediction_modules.prediction_master import MasterF1Predictor
 from simulation import WDCSimulator
 import numpy as np
+import pandas as pd
+import json
+import os
+from pathlib import Path
 
 app = Flask(__name__)
 
 master_predictor = None
 simulator = None
 preprocessor = None
+
+# Cache directory for storing predictions
+CACHE_DIR = Path("prediction_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+def get_cache_filename(race_name):
+    """Generate cache filename for a race"""
+    safe_name = race_name.replace(" ", "_").replace("/", "_")
+    return CACHE_DIR / f"{safe_name}.json"
+
+def save_prediction_to_cache(race_name, prediction_data):
+    """Save prediction to cache file"""
+    try:
+        cache_file = get_cache_filename(race_name)
+        with open(cache_file, 'w') as f:
+            json.dump(prediction_data, f, indent=2)
+        print(f"✓ Cached predictions for {race_name}")
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not cache predictions: {e}")
+        return False
+
+def load_prediction_from_cache(race_name):
+    """Load prediction from cache file"""
+    try:
+        cache_file = get_cache_filename(race_name)
+        if cache_file.exists():
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+            print(f"✓ Loaded cached predictions for {race_name}")
+            return data
+        return None
+    except Exception as e:
+        print(f"⚠️  Could not load cached predictions: {e}")
+        return None
+
+def clear_prediction_cache(race_name):
+    """Clear cache for a specific race"""
+    try:
+        cache_file = get_cache_filename(race_name)
+        if cache_file.exists():
+            cache_file.unlink()
+            print(f"✓ Cleared cache for {race_name}")
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️  Could not clear cache: {e}")
+        return False
+
+def get_race_status(race_name, year=2025):
+    """Check if a race has ended"""
+    try:
+        import fastf1
+        from datetime import datetime, timezone
+        
+        schedule = fastf1.get_event_schedule(year)
+        current_time = datetime.now(timezone.utc)
+        
+        for idx, event in schedule.iterrows():
+            if event['EventName'] == race_name:
+                if pd.notna(event['EventDate']):
+                    event_date = event['EventDate']
+                    
+                    if event_date.tzinfo is None:
+                        event_date = event_date.replace(tzinfo=timezone.utc)
+                    
+                    # Race has ended if current time is after event date
+                    has_ended = current_time > event_date
+                    
+                    return {
+                        'has_ended': has_ended,
+                        'event_date': event_date.isoformat(),
+                        'race_name': race_name
+                    }
+        
+        # Race not found in schedule, assume not ended
+        return {'has_ended': False, 'race_name': race_name}
+    except Exception as e:
+        app.logger.warning(f"Could not check race status: {e}")
+        return {'has_ended': False, 'race_name': race_name}
 
 def initialize_system():
     global master_predictor, simulator, preprocessor
@@ -20,22 +104,33 @@ def initialize_system():
     print("=" * 50)
 
     print("\n[1/4] Loading F1 race data...")
-    print("   Loading 2025 season data only...")
+    print("   Loading 2024 and 2025 season data for training...")
     
-    # Load data from 2025 ONLY
-    try:
-        print(f"   → Loading 2025 season data...")
-        loader = F1DataLoader(year=2025)
-        df = loader.load_race_data(load_all=True)
-        
-        if df.empty:
-            raise ValueError("❌ No data found for 2025 season. The season may not have started yet or no races have been completed.")
-        
-        print(f"\n✓ Loaded dataset: {len(df)} total race results from 2025 season")
-        
-    except Exception as e:
-        print(f"   ⚠️  Error loading 2025 data: {e}")
-        raise ValueError("❌ No F1 data available from 2025. Please check your internet connection or wait for the season to start.")
+    # Load data from both 2024 and 2025
+    all_data = []
+    years_to_load = [2024, 2025]
+    
+    for year in years_to_load:
+        try:
+            print(f"   → Loading {year} season data...")
+            loader = F1DataLoader(year=year)
+            df_year = loader.load_race_data(load_all=True)
+            
+            if not df_year.empty:
+                all_data.append(df_year)
+                print(f"   ✓ Loaded {len(df_year)} results from {year}")
+            else:
+                print(f"   ⚠️  No data found for {year} (season may not have started)")
+        except Exception as e:
+            print(f"   ⚠️  Error loading {year}: {e}")
+    
+    # Combine all data
+    if not all_data:
+        raise ValueError("❌ No F1 data available from any year. Please check your internet connection.")
+    
+    import pandas as pd
+    df = pd.concat(all_data, ignore_index=True)
+    print(f"\n✓ Combined dataset: {len(df)} total race results from {len(all_data)} season(s)")
 
     print("\n[2/4] Preprocessing data...")
     preprocessor = F1DataPreprocessor()
@@ -73,7 +168,7 @@ def initialize_system():
         'STR': 32,    # Lance Stroll :contentReference[oaicite:16]{index=16}
         'TSU': 28,    # Yuki Tsunoda :contentReference[oaicite:17]{index=17}
         'GAS': 22,    # Pierre Gasly :contentReference[oaicite:18]{index=18}
-        'BOR': 19
+        'BOR': 19,    # Nico Borghesi :contentReference[oaicite:19]{index=19}
     }
     
     print(f"\n📊 Current Championship Standings (2025):")
@@ -84,9 +179,20 @@ def initialize_system():
     master_predictor = MasterF1Predictor(model, label_encoders, current_standings)
     simulator = WDCSimulator(preprocessor.get_drivers(), current_standings)
     
+    # Connect qualifying predictor to simulator for grid predictions
+    simulator.set_qualifying_predictor(master_predictor.qualifying_predictor)
+    print("   ✓ Connected qualifying predictor to simulator")
+    
+    # Check existing cache
+    cache_files = list(CACHE_DIR.glob("*.json"))
+    if cache_files:
+        print(f"\n📦 Found {len(cache_files)} cached prediction(s)")
+    
     print("\n" + "=" * 50)
     print("✓ SYSTEM READY!")
-    print(f"✓ Model trained on 2025 season data only")
+    print(f"✓ Model trained on {len(all_data)} season(s): {', '.join(map(str, years_to_load))}")
+    print(f"✓ Total training data: {len(df)} race results")
+    print(f"✓ Predictions cache directory: {CACHE_DIR}")
     print("=" * 50)
     print("\n🌐 Open http://127.0.0.1:5000 in your browser\n")
 
@@ -134,16 +240,45 @@ def home():
 
 @app.route('/predict_race_winner', methods=['POST'])
 def predict_race_winner():
-    """Predict race winner - FIXED VERSION"""
+    """Predict race winner with caching support"""
     data = request.get_json(silent=True) or {}
     race_name = data.get("race_name", "Next Race")
+    force_refresh = data.get("force_refresh", False)
 
     try:
-        # Call the race_winner_predictor directly (not get_comprehensive_predictions)
+        # Check if race has ended
+        race_status = get_race_status(race_name)
+        
+        # If trying to force refresh after race ended, deny it
+        if force_refresh and race_status['has_ended']:
+            app.logger.info(f"Denied refresh for {race_name} - race has ended")
+            return jsonify({
+                'error': 'Race has already ended',
+                'message': f'{race_name} has already taken place. Predictions are locked.',
+                'race_ended': True,
+                'race_name': race_name
+            }), 403
+        
+        # Check cache first (unless force refresh)
+        if not force_refresh:
+            cached_prediction = load_prediction_from_cache(race_name)
+            if cached_prediction:
+                app.logger.info(f"Returning cached prediction for {race_name}")
+                cached_prediction['cached'] = True
+                cached_prediction['race_ended'] = race_status['has_ended']
+                return jsonify(cached_prediction)
+        
+        # Generate new prediction
+        app.logger.info(f"Generating new prediction for {race_name}")
         raw_prediction = master_predictor.race_winner_predictor.predict_race_winner(race_name)
         
         # Clean numpy types
         cleaned = clean_numpy(raw_prediction)
+        cleaned['cached'] = False
+        cleaned['race_ended'] = race_status['has_ended']
+        
+        # Save to cache
+        save_prediction_to_cache(race_name, cleaned)
         
         app.logger.info(f"Race winner prediction for {race_name}: {len(cleaned.get('predictions', []))} drivers")
         
@@ -155,8 +290,26 @@ def predict_race_winner():
             'error': str(e),
             'race_name': race_name,
             'predictions': [],
-            'winner': {}
+            'winner': {},
+            'cached': False
         }), 500
+
+
+@app.route('/clear_cache', methods=['POST'])
+def clear_cache():
+    """Clear cache for a specific race"""
+    data = request.get_json(silent=True) or {}
+    race_name = data.get("race_name")
+    
+    if not race_name:
+        return jsonify({'success': False, 'message': 'No race name provided'}), 400
+    
+    success = clear_prediction_cache(race_name)
+    
+    return jsonify({
+        'success': success,
+        'message': f'Cache cleared for {race_name}' if success else 'Cache not found'
+    })
 
 
 @app.route('/predict', methods=['POST'])
