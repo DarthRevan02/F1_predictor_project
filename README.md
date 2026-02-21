@@ -257,16 +257,16 @@ Forecasts pit stop strategies and tire choices.
 
 | Pos | Driver | Team | Points | Wins |
 |-----|--------|------|--------|------|
-| 1 | L. Norris 🇬🇧 | McLaren | 390 | 7 |
-| 2 | O. Piastri 🇦🇺 | McLaren | 366 | 7 |
-| 3 | M. Verstappen 🇳🇱 | Red Bull | 341 | 5 |
-| 4 | G. Russell 🇬🇧 | Mercedes | 276 | 2 |
-| 5 | C. Leclerc 🇲🇨 | Ferrari | 214 | 0 |
-| 6 | L. Hamilton 🇬🇧 | Ferrari | 148 | 0 |
-| 7 | A.K. Antonelli 🇮🇹 | Mercedes | 122 | 0 |
+| 1 | L. Norris 🇬🇧 | McLaren | 423 | 7 |
+| 2 | M. Verstappen 🇳🇱 | Red Bull | 421 | 8 |
+| 3 | O. Piastri 🇦🇺 | McLaren | 410 | 7 |
+| 4 | G. Russell 🇬🇧 | Mercedes | 319 | 2 |
+| 5 | C. Leclerc 🇲🇨 | Ferrari | 242 | 0 |
+| 6 | L. Hamilton 🇬🇧 | Ferrari | 156 | 0 |
+| 7 | A.K. Antonelli 🇮🇹 | Mercedes | 150 | 0 |
 | 8 | A. Albon 🇹🇭 | Williams | 73 | 0 |
-| 9 | N. Hülkenberg 🇩🇪 | Kick Sauber | 43 | 0 |
-| 10 | I. Hadjar 🇫🇷 | RB | 43 | 0 |
+| 9 | C. Sainz Jr. | Williams | 64 | 0 |
+| 10 | F. Alonso | Aston Martin | 56 | 0 |
 
 ### **2025 Driver Lineup**
 
@@ -598,4 +598,5 @@ python app.py
 **Built with ❤️ for F1 fans by DarthRevan02(Aadi Jain)(RedBull Racing Fan)**
 
 *Last Updated: 2025 Season*
+
 
