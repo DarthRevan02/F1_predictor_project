@@ -595,6 +595,7 @@ python app.py
 
 ---
 
-**Built with ❤️ for F1 fans by F1 fans**
+**Built with ❤️ for F1 fans by DarthRevan02(Aadi Jain)(RedBull Racing Fan)**
 
 *Last Updated: 2025 Season*
+
