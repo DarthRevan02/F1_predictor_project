@@ -1,47 +1,42 @@
 from sklearn.linear_model import LinearRegression
 import numpy as np
 
+
 class F1RaceModel:
-    """Handles training and predictions for race positions"""
-    
+    """Trains a linear regression model to predict finishing positions."""
+
     def __init__(self):
         self.model = None
         self.is_trained = False
-        
+
     def train(self, X, y):
         """
-        Train the linear regression model
-        
-        Args:
-            X: Feature matrix (Driver, Team, Grid Position)
-            y: Target variable (Finishing Position)
+        Train the model.  Raises ValueError on empty input so the caller
+        (initialize_system) surfaces the problem clearly — fixes flaw #9.
         """
+        if len(X) == 0:
+            raise ValueError("Cannot train: feature matrix X is empty.")
+
         self.model = LinearRegression()
         self.model.fit(X, y)
         self.is_trained = True
-        
-        # Calculate and print model performance
+
         score = self.model.score(X, y)
-        print(f"✓ Model trained successfully!")
-        print(f"✓ Model R² score: {score:.3f}")
-        
-        # Print coefficients for interpretation
-        print(f"✓ Model coefficients: {self.model.coef_}")
-        
+        print(f"✓ Model trained on {len(X)} samples — R² = {score:.3f}")
+        print(f"✓ Coefficients: {self.model.coef_}")
         return score
-    
+
     def predict(self, X):
         """
-        Predict race finishing position
-        
-        Args:
-            X: Feature matrix for prediction
-            
-        Returns:
-            Predicted finishing position
+        Predict finishing position.
+
+        Always returns a plain Python int (fixes flaw #10 — numpy int vs
+        Python int ambiguity, and double-rounding in the route handler).
         """
         if not self.is_trained:
-            raise ValueError("Model must be trained before making predictions")
-            
-        prediction = self.model.predict(X)[0]
-        return max(1, round(prediction))
+            raise ValueError("Model must be trained before predicting.")
+
+        raw = self.model.predict(X)
+        # raw is a 1-D numpy array; grab first element, clip to valid range
+        value = float(raw[0]) if hasattr(raw, '__len__') else float(raw)
+        return int(max(1, round(value)))

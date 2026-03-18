@@ -1,379 +1,450 @@
+import os
+import json
+import uuid
+import threading
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 from flask import Flask, render_template_string, request, jsonify
+
 from data_loader import F1DataLoader
 from data_preprocessing import F1DataPreprocessor
 from model_training import F1RaceModel
 from prediction_modules.prediction_master import MasterF1Predictor
 from simulation import WDCSimulator
-import numpy as np
-import pandas as pd
-import json
-import os
-from pathlib import Path
+from driver_config import CURRENT_STANDINGS
+from templates import get_html_template
 
 app = Flask(__name__)
 
-master_predictor = None
-simulator = None
-preprocessor = None
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# Set API_KEY in the environment to protect every mutating endpoint.
+# Example: export API_KEY=my-secret-key
+# Leave unset to disable auth (development only — fixes flaw #2).
+_API_KEY = os.environ.get('API_KEY', '')
 
-# Cache directory for storing predictions
-CACHE_DIR = Path("prediction_cache")
+
+def _check_auth():
+    """Return a 401 response if auth is enabled and the header is wrong."""
+    if not _API_KEY:
+        return None   # auth disabled
+    key = request.headers.get('X-API-Key', '')
+    if key != _API_KEY:
+        return jsonify({'error': 'Unauthorised'}), 401
+    return None
+
+
+# ── App state ─────────────────────────────────────────────────────────────────
+# Wrapped in a single object so the reference is stable after init (flaw #6).
+class _AppState:
+    master_predictor: MasterF1Predictor = None
+    simulator: WDCSimulator = None
+    preprocessor: F1DataPreprocessor = None
+
+
+_state = _AppState()
+
+# ── Prediction cache ──────────────────────────────────────────────────────────
+CACHE_DIR = Path('prediction_cache')
 CACHE_DIR.mkdir(exist_ok=True)
 
-def get_cache_filename(race_name):
-    """Generate cache filename for a race"""
-    safe_name = race_name.replace(" ", "_").replace("/", "_")
-    return CACHE_DIR / f"{safe_name}.json"
+# Per-race lock prevents two simultaneous requests from double-writing cache
+# (fixes flaw #13).
+_cache_locks: dict[str, threading.Lock] = {}
+_cache_locks_lock = threading.Lock()   # protects the dict itself
 
-def save_prediction_to_cache(race_name, prediction_data):
-    """Save prediction to cache file"""
+
+def _get_race_lock(race_name: str) -> threading.Lock:
+    with _cache_locks_lock:
+        if race_name not in _cache_locks:
+            _cache_locks[race_name] = threading.Lock()
+        return _cache_locks[race_name]
+
+
+def _cache_path(race_name: str) -> Path:
+    safe = race_name.replace(' ', '_').replace('/', '_')
+    return CACHE_DIR / f'{safe}.json'
+
+
+def _load_cache(race_name: str):
     try:
-        cache_file = get_cache_filename(race_name)
-        with open(cache_file, 'w') as f:
-            json.dump(prediction_data, f, indent=2)
-        print(f"✓ Cached predictions for {race_name}")
-        return True
+        p = _cache_path(race_name)
+        if p.exists():
+            with p.open() as f:
+                return json.load(f)
     except Exception as e:
-        print(f"⚠️  Could not cache predictions: {e}")
-        return False
+        app.logger.warning(f'Cache load failed: {e}')
+    return None
 
-def load_prediction_from_cache(race_name):
-    """Load prediction from cache file"""
+
+def _save_cache(race_name: str, data: dict):
     try:
-        cache_file = get_cache_filename(race_name)
-        if cache_file.exists():
-            with open(cache_file, 'r') as f:
-                data = json.load(f)
-            print(f"✓ Loaded cached predictions for {race_name}")
-            return data
-        return None
+        with _cache_path(race_name).open('w') as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"⚠️  Could not load cached predictions: {e}")
-        return None
+        app.logger.warning(f'Cache save failed: {e}')
 
-def clear_prediction_cache(race_name):
-    """Clear cache for a specific race"""
+
+def _clear_cache(race_name: str):
     try:
-        cache_file = get_cache_filename(race_name)
-        if cache_file.exists():
-            cache_file.unlink()
-            print(f"✓ Cleared cache for {race_name}")
+        p = _cache_path(race_name)
+        if p.exists():
+            p.unlink()
             return True
-        return False
     except Exception as e:
-        print(f"⚠️  Could not clear cache: {e}")
-        return False
+        app.logger.warning(f'Cache clear failed: {e}')
+    return False
 
-def get_race_status(race_name, year=2025):
-    """Check if a race has ended"""
+
+# ── Background simulation jobs ────────────────────────────────────────────────
+# Simulations run in a worker thread so Flask stays responsive (flaw #5).
+_sim_jobs: dict[str, dict] = {}
+_sim_jobs_lock = threading.Lock()
+
+
+def _run_sim(job_id: str, driver: str, num_sims: int, remaining_races: list, seed):
     try:
-        import fastf1
-        from datetime import datetime, timezone
-        
-        schedule = fastf1.get_event_schedule(year)
-        current_time = datetime.now(timezone.utc)
-        
-        for idx, event in schedule.iterrows():
-            if event['EventName'] == race_name:
-                if pd.notna(event['EventDate']):
-                    event_date = event['EventDate']
-                    
-                    if event_date.tzinfo is None:
-                        event_date = event_date.replace(tzinfo=timezone.utc)
-                    
-                    # Race has ended if current time is after event date
-                    has_ended = current_time > event_date
-                    
-                    return {
-                        'has_ended': has_ended,
-                        'event_date': event_date.isoformat(),
-                        'race_name': race_name
-                    }
-        
-        # Race not found in schedule, assume not ended
-        return {'has_ended': False, 'race_name': race_name}
+        prob, wins, stats = _state.simulator.simulate_season(
+            driver, remaining_races, num_sims, seed=seed
+        )
+        result = {
+            'status': 'done',
+            'probability': prob,
+            'wins': wins,
+            'stats': stats,
+            'remaining_races': remaining_races,
+        }
     except Exception as e:
-        app.logger.warning(f"Could not check race status: {e}")
-        return {'has_ended': False, 'race_name': race_name}
+        result = {'status': 'error', 'error': str(e)}
+
+    with _sim_jobs_lock:
+        _sim_jobs[job_id].update(result)
+
+
+# ── System initialisation ─────────────────────────────────────────────────────
 
 def initialize_system():
-    global master_predictor, simulator, preprocessor
+    print('=' * 55)
+    print('🏎️  F1 PREDICTION SYSTEM INITIALISING')
+    print('=' * 55)
 
-    print("=" * 50)
-    print("🏎️  F1 PREDICTION SYSTEM INITIALIZING")
-    print("=" * 50)
-
-    print("\n[1/4] Loading F1 race data...")
-    print("   Loading 2024 and 2025 season data for training...")
-    
-    # Load data from both 2024 and 2025
     all_data = []
-    years_to_load = [2024, 2025]
-    
-    for year in years_to_load:
+    for year in [2024, 2025]:
         try:
-            print(f"   → Loading {year} season data...")
             loader = F1DataLoader(year=year)
             df_year = loader.load_race_data(load_all=True)
-            
             if not df_year.empty:
                 all_data.append(df_year)
-                print(f"   ✓ Loaded {len(df_year)} results from {year}")
+                print(f'✓ Loaded {len(df_year)} results from {year}')
             else:
-                print(f"   ⚠️  No data found for {year} (season may not have started)")
+                print(f'⚠️  No data for {year}')
         except Exception as e:
-            print(f"   ⚠️  Error loading {year}: {e}")
-    
-    # Combine all data
+            print(f'⚠️  Error loading {year}: {e}')
+
     if not all_data:
-        raise ValueError("❌ No F1 data available from any year. Please check your internet connection.")
-    
-    import pandas as pd
+        raise RuntimeError('No F1 data available from any year.')
+
     df = pd.concat(all_data, ignore_index=True)
-    print(f"\n✓ Combined dataset: {len(df)} total race results from {len(all_data)} season(s)")
 
-    print("\n[2/4] Preprocessing data...")
-    preprocessor = F1DataPreprocessor()
-    df, label_encoders = preprocessor.preprocess_data(df)
+    # Guard: model.train() raises ValueError on empty input (flaw #9 handled
+    # inside F1RaceModel, but we also check here for a clear message).
+    if df.empty:
+        raise RuntimeError('Combined dataset is empty after loading — cannot train model.')
 
-    print("\n[3/4] Training machine learning model...")
+    print(f'\n✓ Combined dataset: {len(df)} results')
+
+    _state.preprocessor = F1DataPreprocessor()
+    df, label_encoders = _state.preprocessor.preprocess_data(df)
+
     X = df[['Driver_Encoded', 'Team_Encoded', 'GridPosition']]
     y = df['Position']
-    
-    if len(X) == 0:
-        raise ValueError("❌ No training data available after preprocessing!")
-    
-    print(f"   Training on {len(X)} race results from 2025...")
     model = F1RaceModel()
     model.train(X, y)
 
-    print("\n[4/4] Initializing predictor and simulator...")
-    # 2025 Championship Standings (Current)
-    current_standings = {
-        'NOR': 390,   # Lando Norris :contentReference[oaicite:1]{index=1}
-        'PIA': 366,   # Oscar Piastri :contentReference[oaicite:2]{index=2}
-        'VER': 366,   # Max Verstappen :contentReference[oaicite:3]{index=3}
-        'RUS': 294,   # George Russell :contentReference[oaicite:4]{index=4}
-        'LEC': 226,   # Charles Leclerc :contentReference[oaicite:5]{index=5}
-        'HAM': 152,   # Lewis Hamilton :contentReference[oaicite:6]{index=6}
-        'ANT': 137,   # Kimi Antonelli :contentReference[oaicite:7]{index=7}
-        'ALB': 73,    # Alexander Albon :contentReference[oaicite:8]{index=8}
-        'HAD': 51,    # Isack Hadjar :contentReference[oaicite:9]{index=9}
-        'HUL': 49,    # Nico Hülkenberg :contentReference[oaicite:10]{index=10}
-        'SAI': 48,    # Carlos Sainz :contentReference[oaicite:11]{index=11}
-        'BEA': 41,    # Oliver Bearman :contentReference[oaicite:12]{index=12}
-        'ALO': 40,    # Fernando Alonso :contentReference[oaicite:13]{index=13}
-        'LAW': 36,    # Liam Lawson :contentReference[oaicite:14]{index=14}
-        'OCO': 32,    # Esteban Ocon :contentReference[oaicite:15]{index=15}
-        'STR': 32,    # Lance Stroll :contentReference[oaicite:16]{index=16}
-        'TSU': 28,    # Yuki Tsunoda :contentReference[oaicite:17]{index=17}
-        'GAS': 22,    # Pierre Gasly :contentReference[oaicite:18]{index=18}
-        'BOR': 19,    # Nico Borghesi :contentReference[oaicite:19]{index=19}
-    }
-    
-    print(f"\n📊 Current Championship Standings (2025):")
-    print(f"   P1: NOR - 390 pts (McLaren)")
-    print(f"   P2: PIA - 366 pts (McLaren)")
-    print(f"   P3: VER - 341 pts (Red Bull)")
+    _state.master_predictor = MasterF1Predictor(model, label_encoders, CURRENT_STANDINGS)
+    _state.simulator = WDCSimulator(_state.preprocessor.get_drivers(), CURRENT_STANDINGS)
+    _state.simulator.set_qualifying_predictor(_state.master_predictor.qualifying_predictor)
 
-    master_predictor = MasterF1Predictor(model, label_encoders, current_standings)
-    simulator = WDCSimulator(preprocessor.get_drivers(), current_standings)
-    
-    # Connect qualifying predictor to simulator for grid predictions
-    simulator.set_qualifying_predictor(master_predictor.qualifying_predictor)
-    print("   ✓ Connected qualifying predictor to simulator")
-    
-    # Check existing cache
-    cache_files = list(CACHE_DIR.glob("*.json"))
-    if cache_files:
-        print(f"\n📦 Found {len(cache_files)} cached prediction(s)")
-    
-    print("\n" + "=" * 50)
-    print("✓ SYSTEM READY!")
-    print(f"✓ Model trained on {len(all_data)} season(s): {', '.join(map(str, years_to_load))}")
-    print(f"✓ Total training data: {len(df)} race results")
-    print(f"✓ Predictions cache directory: {CACHE_DIR}")
-    print("=" * 50)
-    print("\n🌐 Open http://127.0.0.1:5000 in your browser\n")
+    cached = list(CACHE_DIR.glob('*.json'))
+    if cached:
+        print(f'📦 {len(cached)} cached prediction file(s) found')
+
+    print('\n' + '=' * 55)
+    print('✓ SYSTEM READY')
+    print('=' * 55)
+    print('\n🌐 Open http://127.0.0.1:5000\n')
 
 
-def clean_numpy(obj):
-    """Convert numpy types to Python native types"""
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _clean(obj):
+    """Recursively convert numpy types to native Python (for jsonify)."""
     if isinstance(obj, dict):
-        return {k: clean_numpy(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [clean_numpy(i) for i in obj]
-    elif isinstance(obj, (np.int32, np.int64)):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean(i) for i in obj]
+    if isinstance(obj, (np.integer,)):
         return int(obj)
-    elif isinstance(obj, (np.float32, np.float64)):
+    if isinstance(obj, (np.floating,)):
         return float(obj)
-    elif isinstance(obj, np.ndarray):
+    if isinstance(obj, np.ndarray):
         return obj.tolist()
     return obj
 
 
-# ------------------- ROUTES ----------------------
+def _get_race_status(race_name, year=2025):
+    try:
+        import fastf1
+        from datetime import datetime, timezone
+        schedule = fastf1.get_event_schedule(year)
+        now = datetime.now(timezone.utc)
+        for _, event in schedule.iterrows():
+            if event['EventName'] == race_name:
+                ed = event['EventDate']
+                if ed.tzinfo is None:
+                    ed = ed.replace(tzinfo=timezone.utc)
+                return {'has_ended': now > ed, 'race_name': race_name}
+    except Exception:
+        pass
+    return {'has_ended': False, 'race_name': race_name}
+
+
+# ── Input validation helpers ──────────────────────────────────────────────────
+
+def _validate_driver(driver: str):
+    """Return error message if driver is not in the known set, else None."""
+    if not driver or not isinstance(driver, str):
+        return 'driver is required'
+    known = set(_state.preprocessor.get_drivers())
+    if driver not in known:
+        return f'Unknown driver: {driver!r}'
+    return None
+
+
+def _validate_team(team: str):
+    if not team or not isinstance(team, str):
+        return 'team is required'
+    known = set(_state.preprocessor.get_teams())
+    if team not in known:
+        return f'Unknown team: {team!r}'
+    return None
+
+
+def _validate_grid(raw):
+    """Parse and range-check a grid position. Returns (int, error_string)."""
+    try:
+        grid = int(raw)
+    except (TypeError, ValueError):
+        return None, 'grid must be an integer'
+    if not (1 <= grid <= 20):
+        return None, 'grid must be between 1 and 20'
+    return grid, None
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def home():
-    from templates import get_html_template
-    drivers = preprocessor.get_drivers()
-    teams = preprocessor.get_teams()
-    
-    # Get remaining races - fallback to manual list if API fails
+    drivers = _state.preprocessor.get_drivers()
+    teams = _state.preprocessor.get_teams()
     try:
-        remaining_races = simulator.get_remaining_races_info(2025)
-        if not remaining_races:
-            # Fallback for 2025 end of season
-            remaining_races = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
-    except Exception as e:
-        app.logger.warning(f"Could not fetch remaining races: {e}")
-        remaining_races = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
+        remaining = _state.simulator.get_remaining_races_info(2025) or [
+            'Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix'
+        ]
+    except Exception:
+        remaining = ['Las Vegas Grand Prix', 'Qatar Grand Prix', 'Abu Dhabi Grand Prix']
 
     return render_template_string(
         get_html_template(),
         drivers=drivers,
         teams=teams,
-        remaining_races=remaining_races
+        remaining_races=remaining,
     )
 
 
 @app.route('/predict_race_winner', methods=['POST'])
 def predict_race_winner():
-    """Predict race winner with caching support"""
-    data = request.get_json(silent=True) or {}
-    race_name = data.get("race_name", "Next Race")
-    force_refresh = data.get("force_refresh", False)
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
 
-    try:
-        # Check if race has ended
-        race_status = get_race_status(race_name)
-        
-        # If trying to force refresh after race ended, deny it
-        if force_refresh and race_status['has_ended']:
-            app.logger.info(f"Denied refresh for {race_name} - race has ended")
-            return jsonify({
-                'error': 'Race has already ended',
-                'message': f'{race_name} has already taken place. Predictions are locked.',
-                'race_ended': True,
-                'race_name': race_name
-            }), 403
-        
-        # Check cache first (unless force refresh)
+    data = request.get_json(silent=True) or {}
+    race_name = str(data.get('race_name', 'Next Race'))
+    force_refresh = bool(data.get('force_refresh', False))
+
+    race_status = _get_race_status(race_name)
+
+    # Race-ended no longer blocks regeneration — user can always re-predict
+    # and choose whether to persist via the Save button (/save_prediction).
+    # Auto-save only happens on the first fetch (not force_refresh) so that
+    # a manually saved prediction is never silently overwritten.
+    race_lock = _get_race_lock(race_name)
+    with race_lock:
         if not force_refresh:
-            cached_prediction = load_prediction_from_cache(race_name)
-            if cached_prediction:
-                app.logger.info(f"Returning cached prediction for {race_name}")
-                cached_prediction['cached'] = True
-                cached_prediction['race_ended'] = race_status['has_ended']
-                return jsonify(cached_prediction)
-        
-        # Generate new prediction
-        app.logger.info(f"Generating new prediction for {race_name}")
-        raw_prediction = master_predictor.race_winner_predictor.predict_race_winner(race_name)
-        
-        # Clean numpy types
-        cleaned = clean_numpy(raw_prediction)
+            cached = _load_cache(race_name)
+            if cached:
+                cached['cached'] = True
+                cached['race_ended'] = race_status['has_ended']
+                return jsonify(cached)
+
+        raw = _state.master_predictor.race_winner_predictor.predict_race_winner(race_name)
+        cleaned = _clean(raw)
         cleaned['cached'] = False
         cleaned['race_ended'] = race_status['has_ended']
-        
-        # Save to cache
-        save_prediction_to_cache(race_name, cleaned)
-        
-        app.logger.info(f"Race winner prediction for {race_name}: {len(cleaned.get('predictions', []))} drivers")
-        
-        return jsonify(cleaned)
-        
-    except Exception as e:
-        app.logger.error(f"Error in predict_race_winner: {str(e)}", exc_info=True)
-        return jsonify({
-            'error': str(e),
-            'race_name': race_name,
-            'predictions': [],
-            'winner': {},
-            'cached': False
-        }), 500
+
+        # Only auto-persist on first-time fetch, not on user-triggered re-predicts
+        if not force_refresh:
+            _save_cache(race_name, cleaned)
+
+    return jsonify(cleaned)
 
 
 @app.route('/clear_cache', methods=['POST'])
-def clear_cache():
-    """Clear cache for a specific race"""
+def clear_cache_route():
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
     data = request.get_json(silent=True) or {}
-    race_name = data.get("race_name")
-    
+    race_name = data.get('race_name')
     if not race_name:
-        return jsonify({'success': False, 'message': 'No race name provided'}), 400
-    
-    success = clear_prediction_cache(race_name)
-    
-    return jsonify({
-        'success': success,
-        'message': f'Cache cleared for {race_name}' if success else 'Cache not found'
-    })
+        return jsonify({'success': False, 'message': 'race_name required'}), 400
+
+    success = _clear_cache(str(race_name))
+    return jsonify({'success': success})
+
+
+@app.route('/save_prediction', methods=['POST'])
+def save_prediction_route():
+    """
+    Explicitly save (or overwrite) the current prediction for a race to
+    the server-side cache.  The client sends the full prediction payload
+    it already has in memory — no re-computation required.
+    """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    data = request.get_json(silent=True) or {}
+    race_name = data.get('race_name')
+    prediction = data.get('prediction')
+
+    if not race_name or not isinstance(race_name, str):
+        return jsonify({'success': False, 'message': 'race_name required'}), 400
+    if not prediction or not isinstance(prediction, dict):
+        return jsonify({'success': False, 'message': 'prediction payload required'}), 400
+
+    race_lock = _get_race_lock(race_name)
+    with race_lock:
+        _save_cache(race_name, prediction)
+
+    return jsonify({'success': True, 'message': f'Prediction saved for {race_name}'})
 
 
 @app.route('/predict', methods=['POST'])
 def predict_single_driver():
-    """Individual driver position prediction"""
-    data = request.json
+    """Individual driver finishing-position prediction."""
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
 
-    driver = data.get("driver")
-    team = data.get("team")
-    grid = int(data.get("grid"))
+    data = request.get_json(silent=True) or {}
+
+    # --- Input validation (fixes flaw #4) ---
+    driver = data.get('driver', '')
+    team = data.get('team', '')
+    grid_raw = data.get('grid')
+
+    err = _validate_driver(driver)
+    if err:
+        return jsonify({'error': err}), 400
+
+    err = _validate_team(team)
+    if err:
+        return jsonify({'error': err}), 400
+
+    grid, err = _validate_grid(grid_raw)
+    if err:
+        return jsonify({'error': err}), 400
 
     try:
-        # Encode driver and team
-        driver_encoded = master_predictor.label_encoders['Driver'].transform([driver])[0]
-        team_encoded = master_predictor.label_encoders['Team'].transform([team])[0]
-        
-        # Predict
-        X_pred = np.array([[driver_encoded, team_encoded, grid]])
-        predicted_pos = master_predictor.model.predict(X_pred)
-        
-        # Handle both array and scalar returns
-        if isinstance(predicted_pos, (list, np.ndarray)):
-            predicted_pos = predicted_pos[0]
-        
-        return jsonify({"predicted_position": int(round(max(1, predicted_pos)))})
-        
+        driver_enc = _state.master_predictor.label_encoders['Driver'].transform([driver])[0]
+        team_enc = _state.master_predictor.label_encoders['Team'].transform([team])[0]
+        X = np.array([[driver_enc, team_enc, grid]])
+        # Use the model's own predict() which returns a plain Python int (flaw #10)
+        predicted_pos = _state.master_predictor.model.predict(X)
+        return jsonify({'predicted_position': predicted_pos})
     except Exception as e:
-        app.logger.error(f"Error in predict: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        app.logger.error(f'predict error: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/simulate_wdc', methods=['POST'])
 def simulate_wdc():
-    """WDC championship simulation"""
-    data = request.json
-    driver = data['wdcDriver']
-    num_sims = int(data['simulations'])
-    
+    """
+    Start a WDC simulation job and return a job_id immediately.
+    The simulation runs in a background thread (fixes flaw #5).
+    Poll /sim_status/<job_id> for results.
+    """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    data = request.get_json(silent=True) or {}
+
+    # --- Input validation (fixes flaw #4) ---
+    driver = str(data.get('wdcDriver', ''))
+    err = _validate_driver(driver)
+    if err:
+        return jsonify({'error': err}), 400
+
     try:
-        # Get remaining races with fallback
-        try:
-            remaining_races = simulator.get_remaining_races_info(2025)
-            if not remaining_races:
-                remaining_races = ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
-        except:
-            remaining_races = ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
-        
-        probability, wins, stats = simulator.simulate_season(driver, remaining_races, num_sims)
-        
-        result = {
-            'probability': probability,
-            'wins': wins,
-            'stats': stats,
-            'remaining_races': remaining_races
-        }
-        
-        return jsonify(clean_numpy(result))
-        
-    except Exception as e:
-        app.logger.error(f"Error in simulate_wdc: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        num_sims = int(data.get('simulations', 1_000_000))
+        if not (1_000 <= num_sims <= 10_000_000):
+            return jsonify({'error': 'simulations must be between 1,000 and 10,000,000'}), 400
+    except (TypeError, ValueError):
+        return jsonify({'error': 'simulations must be an integer'}), 400
+
+    seed_raw = data.get('seed')
+    seed = int(seed_raw) if seed_raw is not None else None
+
+    try:
+        remaining = _state.simulator.get_remaining_races_info(2025) or [
+            'Qatar Grand Prix', 'Abu Dhabi Grand Prix'
+        ]
+    except Exception:
+        remaining = ['Qatar Grand Prix', 'Abu Dhabi Grand Prix']
+
+    job_id = str(uuid.uuid4())
+    with _sim_jobs_lock:
+        _sim_jobs[job_id] = {'status': 'running'}
+
+    t = threading.Thread(
+        target=_run_sim,
+        args=(job_id, driver, num_sims, remaining, seed),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({'job_id': job_id, 'status': 'running'})
 
 
-# MAIN
+@app.route('/sim_status/<job_id>', methods=['GET'])
+def sim_status(job_id):
+    """Poll for simulation results."""
+    with _sim_jobs_lock:
+        job = _sim_jobs.get(job_id)
+
+    if job is None:
+        return jsonify({'error': 'Unknown job_id'}), 404
+
+    return jsonify(_clean(job))
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
     initialize_system()
-    app.run(debug=True, port=5000)
+    # use_reloader=False prevents double-init of the global state in debug mode
+    app.run(debug=True, port=5000, use_reloader=False)
